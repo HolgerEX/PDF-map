@@ -4,7 +4,7 @@ Bike Map Atlas Generator - Final Working Version
 - No external CLI tools (PaperMap/Mapnik removed)
 - Interactive Matplotlib overview (double-click for scale, drag to move)
 - PDF generation with Matplotlib + contextily (high-res OSM tiles)
-- Per‑page custom scale and center
+- Per-page custom scale and center
 - Split PDF by km or file size
 """
 
@@ -240,7 +240,7 @@ class RouteSplitter:
 
             # overlap handling
             end_m = self.points[best["end_idx"]].distance_m
-            overlap_start_m = end_m #- self.overlap_m
+            overlap_start_m = max(0.0, end_m - self.overlap_m)
             next_i = self._find_index_at_distance(overlap_start_m)
 
             if next_i <= i:
@@ -303,7 +303,7 @@ class RouteSplitter:
                 "score": score
             }
 
-        # ✅ CRITICAL FIX: ensure we ALWAYS return something
+        # Ensure we always return something.
         if best_result is None:
             return {
                 "end_idx": start_idx,
@@ -318,7 +318,7 @@ class RouteSplitter:
     def _create_section(self, start_idx: int, end_idx: int, idx: int, mode: str) -> "MapSection":
         pts = self.points[start_idx:end_idx + 1]
 
-        # UTM bounds (axis‑aligned, used for map extraction)
+        # UTM bounds (axis-aligned, used for map extraction)
         min_x = min(p.easting for p in pts)
         max_x = max(p.easting for p in pts)
         min_y = min(p.northing for p in pts)
@@ -329,14 +329,11 @@ class RouteSplitter:
         # Paper natural orientation
         paper_is_landscape = self.page_width_m >= self.page_height_m
 
-        # Decide page orientation based on mode
+        # Decide page orientation based on mode.
         if mode == "normal":
             orientation = "landscape" if paper_is_landscape else "portrait"
         else:  # rot90
             orientation = "portrait" if paper_is_landscape else "landscape"
-
-        # If your renderer still gets it wrong, uncomment the next line to flip
-        orientation = "landscape" if orientation == "portrait" else "portrait"
 
         bounds_utm = (
             cx - self.page_width_m / 2,
@@ -357,17 +354,6 @@ class RouteSplitter:
             global_scale=self.global_scale
         )
 
-        return MapSection(
-            index=idx,
-            points=pts,
-            bounds_utm=bounds_utm,
-            start_m=pts[0].distance_m,
-            end_m=pts[-1].distance_m,
-            center_utm=(cx, cy),
-            orientation=orientation,
-            paper_size=self.paper_size,
-            global_scale=self.global_scale
-        )
     # -------------------------
     # DISTANCE LOOKUP
     # -------------------------
@@ -380,7 +366,6 @@ class RouteSplitter:
             else:
                 hi = mid - 1
         return max(0, lo)
-
 
 
 # ============================================================================
@@ -407,8 +392,7 @@ class MapRenderer:
             return 14
         else:
             return 12
-            
-            
+
     def render_part_overview(self, sections: List[MapSection], total_km: float, output_path: str):
         """Generate overview PDF for a subset of sections, properly scaled and undistorted."""
         if not sections:
@@ -466,8 +450,8 @@ class MapRenderer:
         from matplotlib.backends.backend_pdf import PdfPages
         with PdfPages(output_path) as pdf:
             pdf.savefig(fig)
-        plt.close(fig)  
-    
+        plt.close(fig)
+
     def render_overview(self, sections: List[MapSection], total_km: float, output_path: str):
         """Generate overview PDF with route and page boxes (A3 landscape, 600 DPI)."""
         all_lons = [p.lon for sec in sections for p in sec.points]
@@ -494,7 +478,7 @@ class MapRenderer:
             ax.text((lon_min+lon_max)/2, (lat_min+lat_max)/2, str(sec.index+1),
                     ha='center', va='center', fontsize=8,
                     bbox=dict(boxstyle='circle', facecolor='white', alpha=0.7))
-        ##ax.set_title(f'Route Overview - {total_km:.1f} km')
+        #ax.set_title(f'Route Overview - {total_km:.1f} km')
         #ax.set_xlabel('Longitude')
         #ax.set_ylabel('Latitude')
         ax.legend()
@@ -510,7 +494,7 @@ class MapRenderer:
     import contextily as ctx
 
     def render_section(self, section: MapSection, output_path: str):
-        """Render a single section as a full‑bleed PDF (no margins, no axes)."""
+        """Render a single section as a full-bleed PDF (no margins, no axes)."""
         w_mm, h_mm = PAPER_SIZES_MM[section.paper_size]
         if section.orientation == "landscape":
             w_mm, h_mm = h_mm, w_mm
@@ -531,7 +515,7 @@ class MapRenderer:
         ax.set_ylim(lat_min, lat_max)
 
         # --- Basemap retry logic ---
-        zoom = self._get_zoom_for_scale(section.effective_scale)
+        zoom = section.effective_zoom
         standard_osm_source = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
         success = False
 
@@ -561,7 +545,7 @@ class MapRenderer:
             print("All tile server attempts failed. Using grey background.")
             ax.set_facecolor('#e0e0e0')
 
-        # Draw route line (thinner, semi‑transparent)
+        # Draw route line (thinner, semi-transparent)
         lons = [p.lon for p in section.points]
         lats = [p.lat for p in section.points]
         ax.plot(lons, lats, 'r-', linewidth=0.5, alpha=0.7, zorder=5)
@@ -575,8 +559,7 @@ class MapRenderer:
         # Save the figure without any extra margins
         plt.savefig(output_path, dpi=self.dpi, bbox_inches=None, pad_inches=0)
         plt.close(fig)
-        
-        
+
     def _get_paper_bounds_utm(self, section: MapSection):
         w_mm, h_mm = PAPER_SIZES_MM[section.paper_size]
         if section.orientation == "landscape":
@@ -619,7 +602,7 @@ class SectionSettingsDialog:
 
         # Zoom level
         tk.Label(self.dialog, text="Tile Zoom Level (0-20, leave empty for auto):").pack(pady=5)
-        self.zoom_var = tk.StringVar(value=str(current_zoom) if current_zoom else "")
+        self.zoom_var = tk.StringVar(value=str(current_zoom) if current_zoom is not None else "")
         tk.Entry(self.dialog, textvariable=self.zoom_var, width=10).pack()
 
         # Buttons
@@ -661,7 +644,7 @@ class SectionSettingsDialog:
 class DraggableRectangle:
     """
     A rectangle that can be dragged with the mouse.
-    Also supports double‑click callback.
+    Also supports double-click callback.
     """
     def __init__(self, rect, section_idx, on_double_click, on_drag_end):
         self.rect = rect
@@ -673,7 +656,7 @@ class DraggableRectangle:
         self.rect.figure.canvas.mpl_connect('button_press_event', self.on_press)
         self.rect.figure.canvas.mpl_connect('button_release_event', self.on_release)
         self.rect.figure.canvas.mpl_connect('motion_notify_event', self.on_motion)
-        # For double‑click detection
+        # For double-click detection
         self._click_timer = None
 
     def on_press(self, event):
@@ -684,7 +667,7 @@ class DraggableRectangle:
             return
         self.press = (event.xdata, event.ydata)
         self.dragging = False
-        # Double‑click detection
+        # Double-click detection
         if self._click_timer is None:
             self._click_timer = self.rect.figure.canvas.new_timer(interval=300)
             self._click_timer.single_shot = True
@@ -727,12 +710,10 @@ class DraggableRectangle:
         self.dragging = False
 
 
-
-
 class InteractivePreview:
     def __init__(self, parent_frame, on_click, on_move, tile_source):
         self.parent = parent_frame
-        self.on_click = on_click          # double‑click → set custom scale
+        self.on_click = on_click          # double-click → set custom scale
         self.on_edit = on_click
         self.on_move = on_move            # drag end → move center
         self.tile_source = tile_source
@@ -836,7 +817,7 @@ class InteractivePreview:
 
             # Multi-line label: page number, scale, zoom info
             label_text = f"{i+1}\n1:{sec.effective_scale:,}"
-            if sec.custom_zoom:
+            if sec.custom_zoom is not None:
                 label_text += f"\nz{sec.custom_zoom}"
             else:
                 label_text += "\nz(auto)"
@@ -846,8 +827,7 @@ class InteractivePreview:
 
         self.ax.set_aspect('equal', adjustable='box')
         self.canvas.draw()
-        
-    
+
     def _utm_to_latlon(self, easting, northing, ref_lat, ref_lon):
         lat_deg_per_m = 1 / 111319.9
         lon_deg_per_m = 1 / (111319.9 * math.cos(math.radians(ref_lat)))
@@ -857,6 +837,7 @@ class InteractivePreview:
         lon = ref_lon + d_e * lon_deg_per_m
         lat = ref_lat + d_n * lat_deg_per_m
         return lon, lat
+
 # ============================================================================
 # MAIN GUI APPLICATION
 # ============================================================================
@@ -875,7 +856,7 @@ class BikeMapAtlasApp:
         self.dpi = 300
         self.output_path = None
         self.split_by = tk.StringVar(value="none")
-        
+
         self._setup_gui()
         self.tile_source = TILE_PROVIDERS[self.tile_var.get()]
 
@@ -883,9 +864,7 @@ class BikeMapAtlasApp:
                                   self._edit_section_properties,
                                   self._on_section_move,
                                   self.tile_source)
-                                  
-                                  
-        
+
     def _setup_gui(self):
         left = ttk.Frame(self.root, width=300)
         left.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
@@ -901,7 +880,7 @@ class BikeMapAtlasApp:
         # Settings
         s_frame = ttk.LabelFrame(left, text="Global Settings", padding=5)
         s_frame.pack(fill='x', pady=5)
-    
+
         ttk.Label(s_frame, text="Paper Size:").grid(row=0, column=0, sticky='w')
         self.paper_var = tk.StringVar(value="A4")
         cb_paper = ttk.Combobox(s_frame, textvariable=self.paper_var, values=list(PAPER_SIZES_MM.keys()), state='readonly')
@@ -913,8 +892,7 @@ class BikeMapAtlasApp:
         cb_scale = ttk.Combobox(s_frame, textvariable=self.scale_var, values=list(MAP_SCALES.keys()), state='readonly')
         cb_scale.grid(row=1, column=1, sticky='w')
         cb_scale.bind('<<ComboboxSelected>>', lambda e: self._update_preview())
-        
-        
+
         ttk.Label(s_frame, text="Tile Server:").grid(row=4, column=0, sticky='w', pady=2)
         self.tile_var = tk.StringVar(value="OpenStreetMap (default)")
         cb_tile = ttk.Combobox(s_frame, textvariable=self.tile_var,
@@ -982,12 +960,11 @@ class BikeMapAtlasApp:
 
     def _on_section_move(self, idx, easting, northing):
         self._set_custom_center(idx, easting, northing)
-        
+
     def _on_tile_changed(self):
         self.tile_source = TILE_PROVIDERS[self.tile_var.get()]
         self._update_preview()
-        
-        
+
     def _edit_section_properties(self, section_idx):
         sec = self.sections[section_idx]
         current_scale = sec.custom_scale if sec.custom_scale is not None else sec.global_scale
@@ -1000,9 +977,8 @@ class BikeMapAtlasApp:
         sec.custom_scale = new_scale
         sec.custom_zoom = new_zoom
         self.preview.update(self.sections, self.total_km)
-        self.status.config(text=f"Section {section_idx+1} updated: scale 1:{new_scale}, zoom {new_zoom if new_zoom else 'auto'}")
-    
-    
+        self.status.config(text=f"Section {section_idx+1} updated: scale 1:{new_scale}, zoom {new_zoom if new_zoom is not None else 'auto'}")
+
     def _set_custom_scale(self, section_idx):
         current = self.sections[section_idx].custom_scale
         default = self.global_scale
@@ -1076,13 +1052,13 @@ class BikeMapAtlasApp:
                 self.overlap_m = float(self.overlap_var.get())
                 splitter = RouteSplitter(self.points, self.global_scale, self.paper_size, self.overlap_m)
                 sections = splitter.split()
-                # Preserve custom settings
                 if hasattr(self, 'sections') and self.sections:
                     for old in self.sections:
                         for new in sections:
                             if new.index == old.index:
                                 new.custom_scale = old.custom_scale
                                 new.custom_center_utm = old.custom_center_utm
+                                new.custom_zoom = old.custom_zoom
                 self.root.after(0, self._display_preview, sections)
             except Exception as e:
                 self.root.after(0, self._on_preview_error, str(e))
@@ -1130,12 +1106,12 @@ class BikeMapAtlasApp:
 
                 splitter = RouteSplitter(self.points, self.global_scale, self.paper_size, self.overlap_m)
                 new_sections = splitter.split()
-                # Transfer custom settings
                 for new in new_sections:
                     for old in self.sections:
                         if old.index == new.index:
                             new.custom_scale = old.custom_scale
                             new.custom_center_utm = old.custom_center_utm
+                            new.custom_zoom = old.custom_zoom
                             break
                 self.sections = new_sections
 
@@ -1145,7 +1121,6 @@ class BikeMapAtlasApp:
 
                 with tempfile.TemporaryDirectory(prefix="bike_atlas_") as tmpdir:
                     tmp = Path(tmpdir)
-                    # Overview page
                     self.root.after(0, self._update_status, "Generating overview map...")
                     overview = tmp / "overview.pdf"
                     renderer.render_overview(self.sections, self.total_km, str(overview))
@@ -1157,7 +1132,6 @@ class BikeMapAtlasApp:
                         renderer.render_section(sec, str(sec_pdf))
                         pdfs.append(sec_pdf)
 
-                    # Split or merge
                     split_mode = self.split_by.get()
                     if split_mode == "km":
                         km_val = float(self.split_km_entry.get() or 0)
@@ -1191,11 +1165,10 @@ class BikeMapAtlasApp:
         """Split by kilometers, each part gets its own overview (first part also gets full overview)."""
         output_base = Path(self.output_path).stem
         output_dir = Path(self.output_path).parent
-        full_overview = pdf_list[0]          # global overview PDF path
-        section_pdfs = pdf_list[1:]          # list of section PDFs (in order)
+        full_overview = pdf_list[0]
+        section_pdfs = pdf_list[1:]
 
-        # Group sections into parts by accumulated km
-        parts = []          # each element: list of MapSection objects
+        parts = []
         current_part_sections = []
         current_km = 0.0
         for i, sec in enumerate(self.sections):
@@ -1208,29 +1181,20 @@ class BikeMapAtlasApp:
         if current_part_sections:
             parts.append(current_part_sections)
 
-        # Generate a PDF file for each part
-        part_start_idx = 0  # index in section_pdfs
+        part_start_idx = 0
         for part_idx, part_sections in enumerate(parts):
             part_num = part_idx + 1
             out_file = output_dir / f"{output_base}_part{part_num}.pdf"
             part_pdfs = []
-
-            # First part includes the full overview
             if part_num == 1:
                 part_pdfs.append(full_overview)
-
-            # Part‑specific overview
             part_overview = output_dir / f"temp_part{part_num}_overview.pdf"
             part_total_km = sum((sec.end_m - sec.start_m)/1000.0 for sec in part_sections)
             self.map_renderer.render_part_overview(part_sections, part_total_km, str(part_overview))
             part_pdfs.append(part_overview)
-
-            # Add the section PDFs belonging to this part
             num_sections = len(part_sections)
             part_pdfs.extend(section_pdfs[part_start_idx:part_start_idx + num_sections])
             part_start_idx += num_sections
-
-            # Merge and save
             self._merge_pdfs(part_pdfs, str(out_file))
             os.unlink(part_overview)
 
@@ -1243,7 +1207,6 @@ class BikeMapAtlasApp:
         full_overview = pdf_list[0]
         section_pdfs = pdf_list[1:]
 
-        # Group sections by accumulated file size (use PDF sizes)
         parts = []
         current_part_sections = []
         current_size = 0.0
@@ -1259,7 +1222,6 @@ class BikeMapAtlasApp:
         if current_part_sections:
             parts.append(current_part_sections)
 
-        # Generate files for each part
         part_start_idx = 0
         for part_idx, part_sections in enumerate(parts):
             part_num = part_idx + 1
@@ -1271,7 +1233,6 @@ class BikeMapAtlasApp:
             part_total_km = sum((sec.end_m - sec.start_m)/1000.0 for sec in part_sections)
             self.map_renderer.render_part_overview(part_sections, part_total_km, str(part_overview))
             part_pdfs.append(part_overview)
-            # Add the section PDFs
             num_sections = len(part_sections)
             part_pdfs.extend(section_pdfs[part_start_idx:part_start_idx + num_sections])
             part_start_idx += num_sections
