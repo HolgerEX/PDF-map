@@ -1,0 +1,1938 @@
+# Code analysis and recommended split
+
+This is a Tkinter desktop application that:
+
+1. Loads a GPX file.
+2. Converts route coordinates to UTM.
+3. Splits the route into map pages.
+4. Displays an interactive preview.
+5. Downloads OpenStreetMap-compatible tiles through `contextily`.
+6. Renders an overview and individual map pages.
+7. Merges or splits the resulting PDF files.
+
+The application has a reasonable overall concept, but the current file contains several correctness problems, duplicated imports, UI-threading hazards, and a few serious map-geometry bugs.
+
+---
+
+# 1. Main problems in the current code
+
+## 1.1 The overlap feature is disabled
+
+In `RouteSplitter.split()`:
+
+```python
+end_m = self.points[best["end_idx"]].distance_m
+overlap_start_m = end_m #- self.overlap_m
+```
+
+The expression after `#` is a comment, so the actual code is equivalent to:
+
+```python
+overlap_start_m = end_m
+```
+
+Therefore, `self.overlap_m` is never used.
+
+It should probably be:
+
+```python
+overlap_start_m = max(
+    0.0,
+    end_m - self.overlap_m
+)
+```
+
+However, this raises another issue: the next section may begin before the previous section ends, but the current splitter evaluates page capacity from the new start point. That is acceptable, but should be explicitly tested.
+
+---
+
+## 1.2 The orientation is always flipped
+
+In `_create_section()`:
+
+```python
+if mode == "normal":
+    orientation = "landscape" if paper_is_landscape else "portrait"
+else:
+    orientation = "portrait" if paper_is_landscape else "landscape"
+
+orientation = "landscape" if orientation == "portrait" else "portrait"
+```
+
+The final assignment always reverses the orientation calculated above.
+
+For example:
+
+```python
+orientation = "landscape"
+```
+
+becomes:
+
+```python
+orientation = "portrait"
+```
+
+This means the splitter's orientation decision is effectively inverted every time.
+
+Remove this line:
+
+```python
+orientation = "landscape" if orientation == "portrait" else "portrait"
+```
+
+If the renderer was previously incorrect, the renderer should be fixed instead of unconditionally flipping the value.
+
+---
+
+## 1.3 There is unreachable duplicate code
+
+`_create_section()` contains two identical return statements:
+
+```python
+return MapSection(
+    ...
+)
+
+return MapSection(
+    ...
+)
+```
+
+The second one can never execute and should be removed.
+
+---
+
+## 1.4 The UTM zone is discarded
+
+The parser calculates a UTM zone:
+
+```python
+easting, northing, _ = UTMConverter.latlon_to_utm(...)
+```
+
+but `RoutePoint` does not store it.
+
+This is dangerous because a route crossing a UTM zone boundary can produce invalid distances and geometry. Easting values reset when entering the next zone.
+
+A safer `RoutePoint` should include:
+
+```python
+utm_zone: int
+```
+
+Alternatively, the entire route should be projected into a single coordinate reference system, preferably using `pyproj`.
+
+For most bicycle routes, `pyproj` is strongly recommended instead of maintaining a handwritten UTM implementation.
+
+---
+
+## 1.5 The handwritten UTM implementation lacks several edge-case rules
+
+The converter does not handle:
+
+- UTM Norway exceptions.
+- UTM Svalbard exceptions.
+- Southern hemisphere false northing.
+- Routes crossing UTM zones.
+- Polar regions.
+- Input validation.
+
+For ordinary European or North American routes within one zone, it may be adequate for approximate distances, but it is not a general-purpose UTM converter.
+
+Use:
+
+```python
+from pyproj import Transformer
+```
+
+For example:
+
+```python
+transformer = Transformer.from_crs(
+    "EPSG:4326",
+    "EPSG:32632",
+    always_xy=True,
+)
+```
+
+The correct UTM EPSG code depends on the longitude zone and hemisphere.
+
+---
+
+## 1.6 GPX segment distance handling is incorrect
+
+The parser loops over each segment:
+
+```python
+for segment in track.segments:
+```
+
+but continues using the same `total_m`.
+
+This means the distance between the last point of one segment and the first point of the next segment is not added, which is usually correct because separate GPX segments may represent disconnected tracks.
+
+However, points from segments with only one point are ignored because points are appended only inside:
+
+```python
+if len(seg_points) > 1:
+```
+
+A one-point segment should either be included or explicitly ignored with a documented reason.
+
+Also, multiple tracks are concatenated into one route even if they are unrelated. A GPX file can contain multiple independent tracks.
+
+A better parser should define one of these policies:
+
+- Parse only the first track.
+- Parse every track as a separate route.
+- Merge tracks only when explicitly requested.
+- Preserve segment boundaries.
+
+---
+
+## 1.7 The splitting algorithm does not guarantee useful minimum page lengths
+
+When a point cannot fit:
+
+```python
+if best_result is None:
+    return {
+        "end_idx": start_idx,
+        "mode": mode,
+        "score": 0
+    }
+```
+
+This creates a section containing one point. The code avoids an infinite loop with:
+
+```python
+if next_i <= i:
+    next_i = i + 1
+```
+
+but a one-point map page may be produced.
+
+This can occur if:
+
+- A single GPX segment jumps farther than one page.
+- The coordinate system is invalid.
+- The selected scale is too large.
+- A route point is an outlier.
+
+The splitter should either:
+
+1. Always create a one-point section intentionally and warn the user.
+2. Search for the next point along the route and create an oversized section.
+3. Raise a clear error explaining that the scale is too large for the route geometry.
+
+---
+
+## 1.8 Section bounds are calculated before custom settings
+
+`MapSection` stores:
+
+```python
+bounds_utm
+```
+
+but the renderer does not use it. Instead, it recalculates the bounds using:
+
+```python
+_get_paper_bounds_utm(section)
+```
+
+This is not inherently wrong, but it makes `bounds_utm` redundant and potentially misleading.
+
+You should either:
+
+- Remove `bounds_utm`, or
+- Update it whenever scale, center, or orientation changes, or
+- Use it consistently as the source of truth.
+
+---
+
+## 1.9 The page size and scale geometry are inconsistent
+
+In `RouteSplitter.__init__()`:
+
+```python
+self.page_width_m = (w_mm / 1000.0) * global_scale
+self.page_height_m = (h_mm / 1000.0) * global_scale
+```
+
+Then in `_create_section()`, bounds are calculated with these original dimensions.
+
+But later, in `_get_paper_bounds_utm()`:
+
+```python
+if section.orientation == "landscape":
+    w_mm, h_mm = h_mm, w_mm
+```
+
+This means the splitter may evaluate one width/height arrangement while the renderer uses another.
+
+The splitter and renderer must use one common page-dimensions function:
+
+```python
+def page_dimensions_m(paper_size, orientation, scale):
+    ...
+```
+
+Both should call that function.
+
+---
+
+## 1.10 The preview and renderer use approximate UTM-to-latitude/longitude conversion
+
+The code uses:
+
+```python
+lat_deg_per_m = 1 / 111319.9
+lon_deg_per_m = 1 / (
+    111319.9 * math.cos(math.radians(ref_lat))
+)
+```
+
+This is only a local approximation. It becomes increasingly inaccurate for:
+
+- Large map pages.
+- High latitudes.
+- Routes covering a large area.
+- Areas far from `ref_lat` and `ref_lon`.
+
+Use a proper projection transformation instead.
+
+---
+
+## 1.11 `contextily` should normally use Web Mercator
+
+The code calls:
+
+```python
+ctx.add_basemap(
+    ax,
+    crs="EPSG:4326",
+    source=self.tile_source,
+    zoom=zoom
+)
+```
+
+Most web map tile providers use EPSG:3857, not EPSG:4326.
+
+Using geographic coordinates directly can cause distortion and incorrect tile positioning. A more reliable process is:
+
+1. Convert route coordinates to EPSG:3857.
+2. Set Matplotlib axes in EPSG:3857.
+3. Call `ctx.add_basemap(ax, crs="EPSG:3857", ...)`.
+4. Convert only for display or GPX parsing when necessary.
+
+Alternatively, let contextily reproject the axes, but the coordinate system must be handled consistently.
+
+---
+
+## 1.12 `effective_zoom` is not used during rendering
+
+`MapSection` provides:
+
+```python
+@property
+def effective_zoom(self) -> int:
+```
+
+But `render_section()` calculates zoom independently:
+
+```python
+zoom = self._get_zoom_for_scale(section.effective_scale)
+```
+
+Therefore, a user-selected custom zoom is ignored during PDF generation.
+
+Change it to:
+
+```python
+zoom = section.effective_zoom
+```
+
+This is one of the most important functional bugs because the GUI allows the user to set a custom zoom level.
+
+---
+
+## 1.13 The custom zoom label contains a bug for zoom level zero
+
+In the preview:
+
+```python
+if sec.custom_zoom:
+    label_text += f"\nz{sec.custom_zoom}"
+else:
+    label_text += "\nz(auto)"
+```
+
+If the user enters zoom `0`, it is treated as false and displayed as `z(auto)`.
+
+Use:
+
+```python
+if sec.custom_zoom is not None:
+    label_text += f"\nz{sec.custom_zoom}"
+else:
+    label_text += "\nz(auto)"
+```
+
+The same distinction should be used everywhere.
+
+---
+
+## 1.14 Tkinter state is read from a worker thread
+
+Inside `thread_generate()`:
+
+```python
+split_mode = self.split_by.get()
+km_val = float(self.split_km_entry.get() or 0)
+```
+
+Tkinter is not thread-safe. These values should be read on the main thread before starting the worker.
+
+Do this in `_generate_pdf()`:
+
+```python
+split_mode = self.split_by.get()
+km_text = self.split_km_entry.get()
+size_text = self.split_size_entry.get()
+```
+
+Then pass the plain Python values into the worker function.
+
+Similarly, this assignment happens in the worker:
+
+```python
+self.sections = new_sections
+self.map_renderer = renderer
+```
+
+It is safer to keep worker results local and send them back to the main thread with `root.after()`.
+
+---
+
+## 1.15 Tkinter dialogs are opened from a worker thread
+
+The PDF splitting methods call:
+
+```python
+messagebox.showinfo(...)
+```
+
+But `_split_by_km()` and `_split_by_filesize()` are called from `thread_generate()`.
+
+Tkinter dialogs must be created on the main thread. Return a result from the worker and show the message through:
+
+```python
+self.root.after(
+    0,
+    lambda: messagebox.showinfo("Split", message)
+)
+```
+
+---
+
+## 1.16 GUI updates can race with multiple preview threads
+
+Every change to paper size, scale, or overlap starts another thread:
+
+```python
+threading.Thread(target=thread_preview, daemon=True).start()
+```
+
+If the user changes settings quickly, an older thread may finish after a newer one and overwrite the preview.
+
+Use a generation counter:
+
+```python
+self.preview_generation += 1
+generation = self.preview_generation
+```
+
+Then only display results if the generation still matches.
+
+A `ThreadPoolExecutor` or a single worker queue would also be cleaner.
+
+---
+
+## 1.17 The preview can download tiles repeatedly
+
+The preview calls:
+
+```python
+ctx.add_basemap(...)
+```
+
+each time `_draw()` runs.
+
+Dragging a section causes:
+
+```python
+self.preview.update(...)
+```
+
+which redraws the entire map and may download tiles again. This is slow and can trigger tile-server rate limits.
+
+Better approaches:
+
+- Cache the basemap.
+- Draw the basemap once and only update rectangle patches.
+- Use a local tile cache.
+- Avoid downloading tiles in the interactive preview unless necessary.
+
+---
+
+## 1.18 Bare `except` statements hide errors
+
+Examples:
+
+```python
+except:
+    ax.set_facecolor("#e0e0e0")
+```
+
+and:
+
+```python
+except:
+    messagebox.showerror(...)
+```
+
+Use:
+
+```python
+except ValueError:
+```
+
+or:
+
+```python
+except Exception as exc:
+    logger.exception("Basemap rendering failed")
+```
+
+Bare exceptions hide programming errors and make debugging difficult.
+
+---
+
+## 1.19 Many imports are duplicated or unused
+
+Unused or duplicated imports include:
+
+```python
+import shutil
+import numpy as np
+from reportlab.lib.pagesizes import A3, A4, A5, A6, letter
+from reportlab.lib.units import mm
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
+import gpxpy.gpx
+import time
+import contextily as ctx
+```
+
+`contextily` is imported multiple times, and `time` is imported multiple times.
+
+The ReportLab imports appear unused because PDF output is produced with Matplotlib and PyPDF2.
+
+A cleaned import block should be much smaller.
+
+---
+
+# 2. Recommended project structure
+
+Split the application into the following files:
+
+```text
+bike_map_atlas/
+├── __init__.py
+├── __main__.py
+├── constants.py
+├── models.py
+├── projection.py
+├── gpx_parser.py
+├── route_splitter.py
+├── map_renderer.py
+├── pdf_tools.py
+├── dialogs.py
+├── draggable.py
+├── preview.py
+├── gui.py
+├── worker.py
+├── requirements.txt
+└── README.md
+```
+
+The responsibility of each file should be:
+
+| File | Responsibility |
+|---|---|
+| `constants.py` | Paper sizes, map scales, tile providers |
+| `models.py` | `RoutePoint` and `MapSection` |
+| `projection.py` | Coordinate transformation and map geometry |
+| `gpx_parser.py` | GPX loading and route extraction |
+| `route_splitter.py` | Page splitting and orientation selection |
+| `map_renderer.py` | Overview and map-page rendering |
+| `pdf_tools.py` | PDF merging and splitting |
+| `dialogs.py` | Tkinter settings dialog |
+| `draggable.py` | Interactive rectangle mouse handling |
+| `preview.py` | Matplotlib preview embedded in Tkinter |
+| `gui.py` | Main application and widgets |
+| `worker.py` | Optional background-task utilities |
+| `__main__.py` | Application entry point |
+
+---
+
+# 3. Refactored files
+
+## `bike_map_atlas/constants.py`
+
+```python
+from __future__ import annotations
+
+PAPER_SIZES_MM: dict[str, tuple[float, float]] = {
+    "A3": (420.0, 297.0),
+    "A4": (297.0, 210.0),
+    "A5": (210.0, 148.0),
+    "A6": (148.0, 105.0),
+    "Letter": (279.0, 216.0),
+}
+
+TILE_PROVIDERS: dict[str, str] = {
+    "OpenStreetMap (default)": (
+        "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+    ),
+    "CyclOSM (bicycle)": (
+        "https://{s}.tile-cyclosm.openstreetmap.fr/"
+        "cyclosm/{z}/{x}/{y}.png"
+    ),
+    "OpenCycleMap": (
+        "https://{s}.tile.opencyclemap.org/"
+        "cycle/{z}/{x}/{y}.png"
+    ),
+}
+
+MAP_SCALES: dict[str, int] = {
+    "1:5,000 (City)": 5_000,
+    "1:10,000 (Town)": 10_000,
+    "1:25,000 (Regional)": 25_000,
+    "1:50,000 (Country)": 50_000,
+    "1:100,000 (Long distance)": 100_000,
+    "1:500,000 (Very Long distance)": 500_000,
+}
+
+DEFAULT_SCALE = 25_000
+DEFAULT_PAPER_SIZE = "A4"
+DEFAULT_OVERLAP_M = 500.0
+DEFAULT_DPI = 300
+```
+
+---
+
+## `bike_map_atlas/models.py`
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass(slots=True)
+class RoutePoint:
+    lat: float
+    lon: float
+    x: float
+    y: float
+    distance_m: float = 0.0
+    zone: Optional[int] = None
+
+
+@dataclass
+class MapSection:
+    index: int
+    points: list[RoutePoint]
+    start_m: float
+    end_m: float
+    center_xy: tuple[float, float]
+    orientation: str
+    paper_size: str
+    global_scale: int
+    custom_scale: Optional[int] = None
+    custom_center_xy: Optional[tuple[float, float]] = None
+    custom_zoom: Optional[int] = None
+
+    @property
+    def effective_scale(self) -> int:
+        return (
+            self.custom_scale
+            if self.custom_scale is not None
+            else self.global_scale
+        )
+
+    @property
+    def effective_center_xy(self) -> tuple[float, float]:
+        return (
+            self.custom_center_xy
+            if self.custom_center_xy is not None
+            else self.center_xy
+        )
+
+    @property
+    def effective_zoom(self) -> int:
+        if self.custom_zoom is not None:
+            return self.custom_zoom
+
+        scale = self.effective_scale
+
+        if scale <= 5_000:
+            return 18
+        if scale <= 10_000:
+            return 17
+        if scale <= 25_000:
+            return 16
+        if scale <= 50_000:
+            return 15
+        if scale <= 100_000:
+            return 14
+        return 12
+
+    def set_custom_center(self, x: float, y: float) -> None:
+        self.custom_center_xy = (x, y)
+```
+
+---
+
+## `bike_map_atlas/projection.py`
+
+This version uses `pyproj`, which should be added to the dependencies.
+
+```python
+from __future__ import annotations
+
+import math
+from functools import lru_cache
+
+from pyproj import Transformer
+
+
+WEB_MERCATOR = "EPSG:3857"
+WGS84 = "EPSG:4326"
+
+
+def utm_zone_for_longitude(lon: float) -> int:
+    return min(60, max(1, int((lon + 180.0) / 6.0) + 1))
+
+
+def utm_epsg(lat: float, lon: float) -> int:
+    zone = utm_zone_for_longitude(lon)
+    return 32600 + zone if lat >= 0 else 32700 + zone
+
+
+@lru_cache(maxsize=120)
+def _transformer(source: str, target: str) -> Transformer:
+    return Transformer.from_crs(
+        source,
+        target,
+        always_xy=True,
+    )
+
+
+def latlon_to_projected(
+    lat: float,
+    lon: float,
+) -> tuple[float, float, int]:
+    epsg = utm_epsg(lat, lon)
+    transformer = _transformer(WGS84, f"EPSG:{epsg}")
+    x, y = transformer.transform(lon, lat)
+    return x, y, epsg
+
+
+def projected_to_latlon(
+    x: float,
+    y: float,
+    epsg: int,
+) -> tuple[float, float]:
+    transformer = _transformer(f"EPSG:{epsg}", WGS84)
+    lon, lat = transformer.transform(x, y)
+    return lat, lon
+
+
+def latlon_to_web_mercator(
+    lat: float,
+    lon: float,
+) -> tuple[float, float]:
+    transformer = _transformer(WGS84, WEB_MERCATOR)
+    x, y = transformer.transform(lon, lat)
+    return x, y
+
+
+def web_mercator_to_latlon(
+    x: float,
+    y: float,
+) -> tuple[float, float]:
+    transformer = _transformer(WEB_MERCATOR, WGS84)
+    lon, lat = transformer.transform(x, y)
+    return lat, lon
+
+
+def page_dimensions_m(
+    paper_size: str,
+    orientation: str,
+    scale: int,
+    paper_sizes_mm: dict[str, tuple[float, float]],
+) -> tuple[float, float]:
+    width_mm, height_mm = paper_sizes_mm[paper_size]
+
+    if orientation == "portrait":
+        width_mm, height_mm = height_mm, width_mm
+
+    return (
+        width_mm / 1000.0 * scale,
+        height_mm / 1000.0 * scale,
+    )
+```
+
+Important: if a route crosses UTM zones, use one projection for the entire route instead of selecting a separate UTM EPSG code for every point. A practical solution is to select the zone from the route's average longitude.
+
+---
+
+## `bike_map_atlas/gpx_parser.py`
+
+```python
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+import gpxpy
+
+from .models import RoutePoint
+from .projection import latlon_to_projected
+
+
+class GPXParser:
+    @staticmethod
+    def parse(
+        file_path: str | Path,
+    ) -> tuple[list[RoutePoint], float]:
+        path = Path(file_path)
+
+        with path.open("r", encoding="utf-8") as file:
+            gpx = gpxpy.parse(file)
+
+        points: list[RoutePoint] = []
+        total_m = 0.0
+
+        for track in gpx.tracks:
+            for segment in track.segments:
+                previous: RoutePoint | None = None
+
+                for gpx_point in segment.points:
+                    x, y, zone = latlon_to_projected(
+                        gpx_point.latitude,
+                        gpx_point.longitude,
+                    )
+
+                    current = RoutePoint(
+                        lat=gpx_point.latitude,
+                        lon=gpx_point.longitude,
+                        x=x,
+                        y=y,
+                        distance_m=total_m,
+                        zone=zone,
+                    )
+
+                    if previous is not None:
+                        total_m += math.hypot(
+                            current.x - previous.x,
+                            current.y - previous.y,
+                        )
+                        current.distance_m = total_m
+
+                    points.append(current)
+                    previous = current
+
+        if len(points) < 2:
+            raise ValueError(
+                "The GPX file must contain at least two track points."
+            )
+
+        return points, total_m / 1000.0
+```
+
+The parser above still merges all track segments. For production use, preserve track and segment boundaries if disconnected routes are possible.
+
+---
+
+## `bike_map_atlas/route_splitter.py`
+
+```python
+from __future__ import annotations
+
+from .constants import PAPER_SIZES_MM
+from .models import MapSection, RoutePoint
+from .projection import page_dimensions_m
+
+
+class RouteSplitter:
+    def __init__(
+        self,
+        points: list[RoutePoint],
+        global_scale: int,
+        paper_size: str,
+        overlap_m: float = 500.0,
+    ) -> None:
+        self.points = points
+        self.global_scale = global_scale
+        self.paper_size = paper_size
+        self.overlap_m = max(0.0, overlap_m)
+
+        self.edge_margin = 0.05
+
+    def split(self) -> list[MapSection]:
+        if not self.points:
+            return []
+
+        sections: list[MapSection] = []
+        start_index = 0
+
+        while start_index < len(self.points):
+            candidates = [
+                self._fit_orientation(start_index, "normal"),
+                self._fit_orientation(start_index, "rot90"),
+            ]
+
+            best = max(
+                candidates,
+                key=lambda item: item["score"],
+            )
+
+            end_index = best["end_idx"]
+
+            sections.append(
+                self._create_section(
+                    start_index=start_index,
+                    end_index=end_index,
+                    index=len(sections),
+                    mode=best["mode"],
+                )
+            )
+
+            if end_index >= len(self.points) - 1:
+                break
+
+            end_distance = self.points[end_index].distance_m
+            next_distance = max(
+                0.0,
+                end_distance - self.overlap_m,
+            )
+
+            next_index = self._find_index_at_distance(next_distance)
+
+            if next_index <= start_index:
+                next_index = start_index + 1
+
+            start_index = next_index
+
+        return sections
+
+    def _available_dimensions(
+        self,
+        mode: str,
+    ) -> tuple[float, float]:
+        paper_width_m, paper_height_m = page_dimensions_m(
+            self.paper_size,
+            "landscape" if mode == "normal" else "portrait",
+            self.global_scale,
+            PAPER_SIZES_MM,
+        )
+
+        return (
+            paper_width_m * (1.0 - 2.0 * self.edge_margin),
+            paper_height_m * (1.0 - 2.0 * self.edge_margin),
+        )
+
+    def _fit_orientation(
+        self,
+        start_idx: int,
+        mode: str,
+    ) -> dict:
+        available_width, available_height = (
+            self._available_dimensions(mode)
+        )
+
+        origin = self.points[start_idx]
+        min_x = max_x = 0.0
+        min_y = max_y = 0.0
+        best: dict | None = None
+
+        for end_idx in range(start_idx + 1, len(self.points)):
+            point = self.points[end_idx]
+
+            dx = point.x - origin.x
+            dy = point.y - origin.y
+
+            if mode == "normal":
+                rx, ry = dx, dy
+            else:
+                rx, ry = dy, -dx
+
+            new_min_x = min(min_x, rx)
+            new_max_x = max(max_x, rx)
+            new_min_y = min(min_y, ry)
+            new_max_y = max(max_y, ry)
+
+            width = new_max_x - new_min_x
+            height = new_max_y - new_min_y
+
+            if width > available_width or height > available_height:
+                break
+
+            min_x = new_min_x
+            max_x = new_max_x
+            min_y = new_min_y
+            max_y = new_max_y
+
+            coverage = end_idx - start_idx
+            area_ratio = (
+                max(width, 1.0) * max(height, 1.0)
+                / (available_width * available_height)
+            )
+
+            score = coverage * (0.3 + 0.7 * area_ratio)
+
+            best = {
+                "end_idx": end_idx,
+                "mode": mode,
+                "score": score,
+            }
+
+        if best is None:
+            # The next point does not fit. We still advance by one point
+            # to prevent an infinite loop.
+            return {
+                "end_idx": min(start_idx + 1, len(self.points) - 1),
+                "mode": mode,
+                "score": 0.0,
+            }
+
+        return best
+
+    def _create_section(
+        self,
+        start_idx: int,
+        end_idx: int,
+        index: int,
+        mode: str,
+    ) -> MapSection:
+        points = self.points[start_idx:end_idx + 1]
+
+        min_x = min(point.x for point in points)
+        max_x = max(point.x for point in points)
+        min_y = min(point.y for point in points)
+        max_y = max(point.y for point in points)
+
+        orientation = (
+            "landscape"
+            if mode == "normal"
+            else "portrait"
+        )
+
+        return MapSection(
+            index=index,
+            points=points,
+            start_m=points[0].distance_m,
+            end_m=points[-1].distance_m,
+            center_xy=(
+                (min_x + max_x) / 2.0,
+                (min_y + max_y) / 2.0,
+            ),
+            orientation=orientation,
+            paper_size=self.paper_size,
+            global_scale=self.global_scale,
+        )
+
+    def _find_index_at_distance(self, distance_m: float) -> int:
+        low = 0
+        high = len(self.points) - 1
+
+        while low <= high:
+            middle = (low + high) // 2
+
+            if self.points[middle].distance_m < distance_m:
+                low = middle + 1
+            else:
+                high = middle - 1
+
+        return min(max(low, 0), len(self.points) - 1)
+```
+
+This removes the unconditional orientation flip and activates overlap.
+
+---
+
+## `bike_map_atlas/map_renderer.py`
+
+The renderer should use the section's effective zoom:
+
+```python
+zoom = section.effective_zoom
+```
+
+A simplified corrected version of the relevant method is:
+
+```python
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import contextily as ctx
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.patches import Rectangle
+
+from .constants import PAPER_SIZES_MM, TILE_PROVIDERS
+from .models import MapSection
+from .projection import page_dimensions_m
+
+
+class MapRenderer:
+    def __init__(
+        self,
+        global_scale: int,
+        dpi: int = 300,
+        tile_source: str | None = None,
+    ) -> None:
+        self.global_scale = global_scale
+        self.dpi = dpi
+        self.tile_source = (
+            tile_source
+            or TILE_PROVIDERS["OpenStreetMap (default)"]
+        )
+
+    def render_section(
+        self,
+        section: MapSection,
+        output_path: str | Path,
+    ) -> None:
+        width_m, height_m = page_dimensions_m(
+            section.paper_size,
+            section.orientation,
+            section.effective_scale,
+            PAPER_SIZES_MM,
+        )
+
+        width_mm, height_mm = PAPER_SIZES_MM[section.paper_size]
+
+        if section.orientation == "portrait":
+            width_mm, height_mm = height_mm, width_mm
+
+        figure = plt.figure(
+            figsize=(width_mm / 25.4, height_mm / 25.4),
+            dpi=self.dpi,
+        )
+
+        axis = figure.add_axes([0, 0, 1, 1])
+        axis.set_axis_off()
+
+        center_x, center_y = section.effective_center_xy
+
+        xmin = center_x - width_m / 2.0
+        xmax = center_x + width_m / 2.0
+        ymin = center_y - height_m / 2.0
+        ymax = center_y + height_m / 2.0
+
+        axis.set_xlim(xmin, xmax)
+        axis.set_ylim(ymin, ymax)
+
+        zoom = section.effective_zoom
+
+        try:
+            ctx.add_basemap(
+                axis,
+                crs="EPSG:3857",
+                source=self.tile_source,
+                zoom=zoom,
+            )
+        except Exception:
+            axis.set_facecolor("#e0e0e0")
+
+        axis.plot(
+            [point.x for point in section.points],
+            [point.y for point in section.points],
+            color="red",
+            linewidth=0.5,
+            alpha=0.7,
+            zorder=5,
+        )
+
+        figure.savefig(
+            output_path,
+            format="pdf",
+            dpi=self.dpi,
+            bbox_inches=None,
+            pad_inches=0,
+        )
+
+        plt.close(figure)
+
+    def render_overview(
+        self,
+        sections: list[MapSection],
+        total_km: float,
+        output_path: str | Path,
+    ) -> None:
+        if not sections:
+            return
+
+        points = [
+            point
+            for section in sections
+            for point in section.points
+        ]
+
+        xs = [point.x for point in points]
+        ys = [point.y for point in points]
+
+        x_padding = max((max(xs) - min(xs)) * 0.1, 100.0)
+        y_padding = max((max(ys) - min(ys)) * 0.1, 100.0)
+
+        figure, axis = plt.subplots(
+            figsize=(16.5, 11.7),
+            dpi=self.dpi,
+        )
+
+        axis.set_xlim(
+            min(xs) - x_padding,
+            max(xs) + x_padding,
+        )
+        axis.set_ylim(
+            min(ys) - y_padding,
+            max(ys) + y_padding,
+        )
+        axis.set_aspect("equal")
+
+        try:
+            ctx.add_basemap(
+                axis,
+                crs="EPSG:3857",
+                source=self.tile_source,
+                zoom="auto",
+            )
+        except Exception:
+            axis.set_facecolor("#e0e0e0")
+
+        axis.plot(
+            xs,
+            ys,
+            color="red",
+            linewidth=1.0,
+        )
+
+        for section in sections:
+            width_m, height_m = page_dimensions_m(
+                section.paper_size,
+                section.orientation,
+                section.effective_scale,
+                PAPER_SIZES_MM,
+            )
+
+            center_x, center_y = section.effective_center_xy
+
+            rectangle = Rectangle(
+                (
+                    center_x - width_m / 2.0,
+                    center_y - height_m / 2.0,
+                ),
+                width_m,
+                height_m,
+                fill=False,
+                edgecolor="blue",
+                linewidth=1.5,
+                linestyle="--",
+            )
+
+            axis.add_patch(rectangle)
+            axis.text(
+                center_x,
+                center_y,
+                str(section.index + 1),
+                ha="center",
+                va="center",
+                bbox={
+                    "boxstyle": "circle",
+                    "facecolor": "white",
+                    "alpha": 0.7,
+                },
+            )
+
+        axis.set_axis_off()
+
+        with PdfPages(output_path) as pdf:
+            pdf.savefig(figure)
+
+        plt.close(figure)
+```
+
+This renderer assumes that `RoutePoint.x` and `RoutePoint.y` are in EPSG:3857. The parser and projection layer must therefore be aligned with this choice.
+
+---
+
+## `bike_map_atlas/pdf_tools.py`
+
+```python
+from __future__ import annotations
+
+from pathlib import Path
+
+from PyPDF2 import PdfMerger
+
+
+def merge_pdfs(
+    input_paths: list[str | Path],
+    output_path: str | Path,
+) -> None:
+    merger = PdfMerger()
+
+    try:
+        for input_path in input_paths:
+            merger.append(str(input_path))
+
+        merger.write(str(output_path))
+    finally:
+        merger.close()
+```
+
+---
+
+## `bike_map_atlas/dialogs.py`
+
+```python
+from __future__ import annotations
+
+import tkinter as tk
+from tkinter import messagebox
+
+
+class SectionSettingsDialog:
+    def __init__(
+        self,
+        parent: tk.Misc,
+        section_idx: int,
+        current_scale: int,
+        current_zoom: int | None,
+        callback,
+    ) -> None:
+        self.section_idx = section_idx
+        self.callback = callback
+
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title(
+            f"Section {section_idx + 1} Settings"
+        )
+        self.dialog.geometry("320x220")
+        self.dialog.transient(parent)
+        self.dialog.resizable(False, False)
+
+        tk.Label(
+            self.dialog,
+            text="Map scale denominator:",
+        ).pack(pady=5)
+
+        self.scale_var = tk.StringVar(
+            value=str(current_scale)
+        )
+
+        tk.Entry(
+            self.dialog,
+            textvariable=self.scale_var,
+            width=15,
+        ).pack()
+
+        tk.Label(
+            self.dialog,
+            text="Tile zoom, 0-20; empty means automatic:",
+        ).pack(pady=5)
+
+        self.zoom_var = tk.StringVar(
+            value=(
+                str(current_zoom)
+                if current_zoom is not None
+                else ""
+            )
+        )
+
+        tk.Entry(
+            self.dialog,
+            textvariable=self.zoom_var,
+            width=10,
+        ).pack()
+
+        buttons = tk.Frame(self.dialog)
+        buttons.pack(pady=15)
+
+        tk.Button(
+            buttons,
+            text="Apply",
+            command=self._apply,
+        ).pack(side=tk.LEFT, padx=5)
+
+        tk.Button(
+            buttons,
+            text="Cancel",
+            command=self.dialog.destroy,
+        ).pack(side=tk.LEFT)
+
+        self.dialog.after(10, self._grab)
+
+    def _grab(self) -> None:
+        self.dialog.grab_set()
+        self.dialog.focus_set()
+
+    def _apply(self) -> None:
+        try:
+            scale = int(self.scale_var.get())
+
+            if scale <= 0:
+                raise ValueError
+
+        except ValueError:
+            messagebox.showerror(
+                "Invalid scale",
+                "Scale must be a positive integer.",
+            )
+            return
+
+        zoom_text = self.zoom_var.get().strip()
+        zoom: int | None = None
+
+        if zoom_text:
+            try:
+                zoom = int(zoom_text)
+
+                if not 0 <= zoom <= 20:
+                    raise ValueError
+
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid zoom",
+                    "Zoom must be an integer from 0 to 20.",
+                )
+                return
+
+        self.callback(
+            self.section_idx,
+            scale,
+            zoom,
+        )
+
+        self.dialog.destroy()
+```
+
+---
+
+## `bike_map_atlas/draggable.py`
+
+```python
+from __future__ import annotations
+
+
+class DraggableRectangle:
+    def __init__(
+        self,
+        rectangle,
+        section_idx: int,
+        on_double_click,
+        on_drag_end,
+    ) -> None:
+        self.rectangle = rectangle
+        self.section_idx = section_idx
+        self.on_double_click = on_double_click
+        self.on_drag_end = on_drag_end
+
+        self.press_position = None
+        self.dragging = False
+        self.click_timer = None
+
+        canvas = rectangle.figure.canvas
+        canvas.mpl_connect(
+            "button_press_event",
+            self.on_press,
+        )
+        canvas.mpl_connect(
+            "button_release_event",
+            self.on_release,
+        )
+        canvas.mpl_connect(
+            "motion_notify_event",
+            self.on_motion,
+        )
+
+    def on_press(self, event) -> None:
+        if event.inaxes != self.rectangle.axes:
+            return
+
+        contains, _ = self.rectangle.contains(event)
+
+        if not contains:
+            return
+
+        self.press_position = (
+            event.xdata,
+            event.ydata,
+        )
+        self.dragging = False
+
+        if self.click_timer is None:
+            self.click_timer = (
+                self.rectangle.figure.canvas.new_timer(
+                    interval=300,
+                )
+            )
+            self.click_timer.single_shot = True
+            self.click_timer.add_callback(
+                self._clear_click_timer,
+            )
+            self.click_timer.start()
+        else:
+            self.click_timer.stop()
+            self.click_timer = None
+            self.on_double_click(self.section_idx)
+
+    def _clear_click_timer(self) -> None:
+        self.click_timer = None
+
+    def on_motion(self, event) -> None:
+        if self.press_position is None:
+            return
+
+        if event.inaxes != self.rectangle.axes:
+            return
+
+        if event.xdata is None or event.ydata is None:
+            return
+
+        old_x, old_y = self.press_position
+        dx = event.xdata - old_x
+        dy = event.ydata - old_y
+
+        if abs(dx) > 0.005 or abs(dy) > 0.005:
+            self.dragging = True
+
+            x, y = self.rectangle.xy
+            self.rectangle.set_xy((x + dx, y + dy))
+
+            self.press_position = (
+                event.xdata,
+                event.ydata,
+            )
+
+            self.rectangle.figure.canvas.draw_idle()
+
+    def on_release(self, event) -> None:
+        if self.press_position is None:
+            return
+
+        if self.dragging:
+            x, y = self.rectangle.xy
+            width = self.rectangle.get_width()
+            height = self.rectangle.get_height()
+
+            center_x = x + width / 2.0
+            center_y = y + height / 2.0
+
+            self.on_drag_end(
+                self.section_idx,
+                center_x,
+                center_y,
+            )
+
+        self.press_position = None
+        self.dragging = False
+```
+
+This version keeps the rectangle in the same projected coordinate system as the renderer. It no longer converts the drag location through an inaccurate local UTM approximation.
+
+---
+
+# 4. GUI-specific changes
+
+The main GUI can remain in `gui.py`, but it should be changed in these areas.
+
+## Read Tkinter values before starting the worker
+
+Instead of:
+
+```python
+def thread_generate():
+    split_mode = self.split_by.get()
+    km_val = float(self.split_km_entry.get() or 0)
+```
+
+use:
+
+```python
+def _generate_pdf(self):
+    if not self.points:
+        messagebox.showwarning(
+            "No data",
+            "Load a GPX file first",
+        )
+        return
+
+    if not self.output_path:
+        messagebox.showwarning(
+            "No output",
+            "Select an output PDF file",
+        )
+        return
+
+    split_mode = self.split_by.get()
+    km_text = self.split_km_entry.get()
+    size_text = self.split_size_entry.get()
+
+    try:
+        km_value = float(km_text or 0)
+        size_value = float(size_text or 0)
+        dpi = int(self.dpi_var.get())
+        overlap_m = float(self.overlap_var.get())
+    except ValueError as exc:
+        messagebox.showerror(
+            "Invalid settings",
+            str(exc),
+        )
+        return
+
+    self._set_buttons_state("disabled")
+    self.progress.start()
+
+    thread = threading.Thread(
+        target=self._generate_worker,
+        args=(
+            split_mode,
+            km_value,
+            size_value,
+            dpi,
+            overlap_m,
+        ),
+        daemon=True,
+    )
+    thread.start()
+```
+
+Then the worker receives only normal Python values:
+
+```python
+def _generate_worker(
+    self,
+    split_mode: str,
+    km_value: float,
+    size_value: float,
+    dpi: int,
+    overlap_m: float,
+) -> None:
+    try:
+        # Perform expensive work here.
+        # Do not call Tkinter methods directly here.
+        ...
+    except Exception as exc:
+        self.root.after(
+            0,
+            self._generation_done,
+            False,
+            str(exc),
+        )
+```
+
+---
+
+# 5. Corrected PDF split design
+
+The current split methods are tightly coupled to the GUI. They should be moved into a separate service.
+
+## `bike_map_atlas/pdf_splitter.py`
+
+```python
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from .map_renderer import MapRenderer
+from .models import MapSection
+from .pdf_tools import merge_pdfs
+
+
+class PDFSplitter:
+    def __init__(
+        self,
+        output_path: str | Path,
+        renderer: MapRenderer,
+    ) -> None:
+        self.output_path = Path(output_path)
+        self.renderer = renderer
+
+    def split_by_km(
+        self,
+        overview_pdf: Path,
+        section_pdfs: list[Path],
+        sections: list[MapSection],
+        km_per_file: float,
+    ) -> list[Path]:
+        groups: list[list[int]] = []
+        current: list[int] = []
+        current_km = 0.0
+
+        for index, section in enumerate(sections):
+            section_km = (
+                section.end_m - section.start_m
+            ) / 1000.0
+
+            current.append(index)
+            current_km += section_km
+
+            if current_km >= km_per_file:
+                groups.append(current)
+                current = []
+                current_km = 0.0
+
+        if current:
+            groups.append(current)
+
+        return self._write_groups(
+            groups,
+            overview_pdf,
+            section_pdfs,
+            sections,
+        )
+
+    def split_by_size(
+        self,
+        overview_pdf: Path,
+        section_pdfs: list[Path],
+        sections: list[MapSection],
+        max_mb: float,
+    ) -> list[Path]:
+        groups: list[list[int]] = []
+        current: list[int] = []
+        current_size = 0.0
+
+        for index, section_pdf in enumerate(section_pdfs):
+            size_mb = (
+                os.path.getsize(section_pdf)
+                / (1024.0 * 1024.0)
+            )
+
+            if current and current_size + size_mb > max_mb:
+                groups.append(current)
+                current = []
+                current_size = 0.0
+
+            current.append(index)
+            current_size += size_mb
+
+        if current:
+            groups.append(current)
+
+        return self._write_groups(
+            groups,
+            overview_pdf,
+            section_pdfs,
+            sections,
+        )
+
+    def _write_groups(
+        self,
+        groups: list[list[int]],
+        overview_pdf: Path,
+        section_pdfs: list[Path],
+        sections: list[MapSection],
+    ) -> list[Path]:
+        outputs: list[Path] = []
+        base = self.output_path.stem
+        directory = self.output_path.parent
+
+        for group_number, group in enumerate(groups, start=1):
+            part_output = directory / (
+                f"{base}_part{group_number}.pdf"
+            )
+
+            inputs: list[Path] = []
+
+            if group_number == 1:
+                inputs.append(overview_pdf)
+
+            part_sections = [
+                sections[index]
+                for index in group
+            ]
+
+            part_overview = directory / (
+                f".{base}_part{group_number}_overview.pdf"
+            )
+
+            total_km = sum(
+                (
+                    section.end_m - section.start_m
+                ) / 1000.0
+                for section in part_sections
+            )
+
+            self.renderer.render_overview(
+                part_sections,
+                total_km,
+                part_overview,
+            )
+
+            inputs.append(part_overview)
+            inputs.extend(
+                section_pdfs[index]
+                for index in group
+            )
+
+            merge_pdfs(inputs, part_output)
+            part_overview.unlink(missing_ok=True)
+
+            outputs.append(part_output)
+
+        return outputs
+```
+
+The PDF splitter now has no dependency on Tkinter and can be tested independently.
+
+---
+
+# 6. `requirements.txt`
+
+```text
+contextily
+gpxpy
+matplotlib
+numpy
+Pillow
+PyPDF2
+pyproj
+requests
+```
+
+The following packages from the original code can be removed unless used elsewhere:
+
+```text
+reportlab
+```
+
+The original code imports ReportLab, but it does not actually use it for PDF generation.
+
+---
+
+# 7. `__main__.py`
+
+```python
+from .gui import BikeMapAtlasApp
+
+
+def main() -> None:
+    app = BikeMapAtlasApp()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run it with:
+
+```bash
+python -m bike_map_atlas
+```
+
+---
+
+# 8. Recommended directory layout after splitting
+
+```text
+project/
+│
+├── bike_map_atlas/
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── constants.py
+│   ├── models.py
+│   ├── projection.py
+│   ├── gpx_parser.py
+│   ├── route_splitter.py
+│   ├── map_renderer.py
+│   ├── pdf_tools.py
+│   ├── pdf_splitter.py
+│   ├── dialogs.py
+│   ├── draggable.py
+│   ├── preview.py
+│   └── gui.py
+│
+├── requirements.txt
+└── README.md
+```
+
+---
+
+# 9. Priority order for fixing the existing code
+
+If you want to make the current single-file version work before splitting it, fix these items first:
+
+1. Remove the unconditional orientation flip:
+
+   ```python
+   orientation = "landscape" if orientation == "portrait" else "portrait"
+   ```
+
+2. Enable overlap:
+
+   ```python
+   overlap_start_m = max(
+       0.0,
+       end_m - self.overlap_m,
+   )
+   ```
+
+3. Use the custom zoom:
+
+   ```python
+   zoom = section.effective_zoom
+   ```
+
+4. Replace:
+
+   ```python
+   if sec.custom_zoom:
+   ```
+
+   with:
+
+   ```python
+   if sec.custom_zoom is not None:
+   ```
+
+5. Remove the duplicate return statement.
+
+6. Remove unused imports.
+
+7. Read Tkinter variables before starting background threads.
+
+8. Move all dialogs and GUI updates to the Tkinter main thread.
+
+9. Use a proper projection library such as `pyproj`.
+
+10. Use EPSG:3857 consistently with `contextily`.
+
+11. Add a generation counter or cancellation mechanism for preview threads.
+
+12. Move PDF merging and splitting out of the GUI class.
+
+The current design is suitable for modularization, but the most important correctness issues are the disabled overlap, unconditional orientation reversal, ignored custom zoom, inaccurate coordinate conversion, and Tkinter access from worker threads.
